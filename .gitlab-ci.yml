@@ -1,0 +1,165 @@
+image:
+  name: hashicorp/terraform:1.6
+  entrypoint:
+    - "/usr/bin/env"
+    - "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+variables:
+  TF_ADDRESS: "https://gitlab.com/api/v4/projects/${CI_PROJECT_ID}/terraform/state/default-terraform.tfstate"
+  AWS_CREDENTIALS_CHECK: 'aws sts get-caller-identity || { echo "Error: AWS credentials are not valid. Exiting the pipeline."; exit_code=$?; echo "{\"content\": \"Error: AWS credentials are invalid, stopping the pipeline.\"}" | curl -X POST -H "Content-Type: application/json" -d @- $DISCORD_WEBHOOK_URL; exit 1; }'
+  SAST_IMAGE_SUFFIX: '-fips'
+  FF_NETWORK_PER_BUILD: "true"
+
+cache:
+  paths:
+    - .terraform
+
+before_script:
+  - apk add --update git curl bash aws-cli jq
+  - cd ./infrastructure
+  - rm -rf .terraform
+  - terraform --version
+  - export AWS_ACCESS_KEY_ID
+  - export AWS_SECRET_ACCESS_KEY
+  - check_aws_credentials() { eval $AWS_CREDENTIALS_CHECK; }
+  - check_aws_credentials
+  - terraform init
+    -backend-config=address=${TF_ADDRESS}
+    -backend-config=lock_address=${TF_ADDRESS}/lock
+    -backend-config=unlock_address=${TF_ADDRESS}/lock
+    -backend-config=username=${TF_USERNAME}
+    -backend-config=password=${TF_PASSWORD}
+    -backend-config=lock_method=POST
+    -backend-config=unlock_method=DELETE
+    -backend-config=retry_wait_min=5
+
+stages:
+  - package
+  - validate
+  - plan
+  - apply
+  - test
+  - update
+  - destroy
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+
+build docker image:
+  stage: package
+  only:
+    changes:
+      - "application/**/*"
+  before_script: []
+  image: docker:20.10.12
+  services:
+    - docker:20.10.12-dind
+  script:
+    - cd ./application
+    - docker build -t $CI_REGISTRY_IMAGE -t $CI_REGISTRY_IMAGE:$CI_PIPELINE_IID .
+    - docker image ls
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER $CI_REGISTRY_IMAGE --password-stdin
+    - docker push --all-tags $CI_REGISTRY_IMAGE
+
+validate:
+  stage: validate
+  script:
+    - terraform validate
+    - pwd
+    - |
+       /bin/sh ../discord.sh "Validation stage $(if [ $? -eq 0 ]; then echo succeeded; else echo failed; fi)"
+
+plan:
+  stage: plan
+  script:
+    - apk add --no-cache curl
+    - echo "### Running terraform plan..."
+    - terraform plan -var "db_username=$DB_USERNAME" -var "db_password=$DB_PASSWORD" -var "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" -var "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" -var "AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN" -input=false -out default.tfplan
+    - pwd
+    - |
+       /bin/sh ../discord.sh "Plan stage $(if [ $? -eq 0 ]; then echo succeeded; else echo failed; fi)"
+  dependencies:
+    - validate
+  artifacts:
+    paths:
+      - "**/*.tfplan"
+      - "**/.terraform.lock.hcl"
+
+apply:
+  stage: apply
+  script:
+    - apk add --no-cache curl
+    - echo "### Applying terraform code"
+    - terraform apply -auto-approve -input=false default.tfplan
+    - echo "###Backscript checkt status"
+    - chmod +x ./terminate_instance.sh
+    - ./terminate_instance.sh
+    - terraform state rm aws_instance.sql_execution_instance
+    - pwd
+    - |
+       /bin/sh ../discord.sh "apply stage $(if [ $? -eq 0 ]; then echo succeeded; else echo failed; fi)"
+  dependencies:
+    - plan
+  artifacts:
+    paths:
+      - "**/*.tfplan"
+      - "**/.terraform.lock.hcl"
+
+test:
+  stage: test
+  script:
+    - sh ../tests/test.sh
+    - pwd
+    - |
+       /bin/sh ../discord.sh "test stage $(if [ $? -eq 0 ]; then echo succeeded; else echo failed; fi)"
+  dependencies:
+    - apply
+
+sast:
+  stage: test
+  before_script: []
+  image: registry.gitlab.com/security-products/semgrep:4-fips
+  artifacts:
+    name: sast
+    reports:
+      sast: gl-sast-report.json
+    paths:
+      - gl-sast-report.json
+  dependencies:
+    - apply
+
+update_image:
+  stage: update
+  only:
+    changes:
+      - "application/**/*"
+  script:
+    - terraform apply -var "db_username=$DB_USERNAME" -var "db_password=$DB_PASSWORD" -var "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" -var "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" -var "AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN" -replace "aws_ecs_task_definition.lms" -auto-approve
+  dependencies:
+    - apply
+
+destroy_all:
+  stage: destroy
+  script:
+    - apk add --no-cache curl
+    - echo "### Destroying all the terraform resources"
+    - terraform destroy -var "db_username=$DB_USERNAME" -var "db_password=$DB_PASSWORD" -var "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" -var "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" -var "AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN" -auto-approve
+    - pwd
+    - |
+       /bin/sh ../discord.sh "Destroy stage $(if [ $? -eq 0 ]; then echo succeeded; else echo failed; fi)"
+  dependencies:
+    - apply
+  when: manual
+
+destroy_keep_data:
+  stage: destroy
+  script:
+    - apk add --no-cache curl
+    - echo "### Destroying all the terraform resources but RDS"
+    - terraform destroy -var "db_username=$DB_USERNAME" -var "db_password=$DB_PASSWORD" -var "AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID" -var "AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY" -var "AWS_SESSION_TOKEN=$AWS_SESSION_TOKEN" --target="aws_ecs_task_definition.lms" --target="aws_ecs_cluster.my_cluster" --target="aws_instance.sql_execution_instance" --target="aws_lb.ecs_alb" --target="aws_lb_target_group.ecs_target_group" --target="aws_s3_bucket.my_s3_bucket" --target="aws_s3_object.lms_sql" -auto-approve
+    - pwd
+    - |
+       /bin/sh ../discord.sh "Destroy stage $(if [ $? -eq 0 ]; then echo succeeded; else echo failed; fi)"
+  dependencies:
+    - apply
+  when: manual
